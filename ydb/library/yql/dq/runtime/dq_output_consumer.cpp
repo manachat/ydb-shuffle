@@ -13,6 +13,21 @@
 
 #include <yql/essentials/utils/yql_panic.h>
 
+#define coordinator_v0
+
+#ifdef coordinator_v0
+
+#include <mutex>
+#include <util/generic/vector.h>
+#include <unordered_map>
+#include <atomic>
+#include <thread>
+#include <functional>
+
+#include <ydb/library/formats/arrow/size_calcer.h>
+
+#endif
+
 namespace NYql::NDq {
 
 namespace {
@@ -20,6 +35,148 @@ namespace {
 using namespace NKikimr;
 using namespace NMiniKQL;
 using namespace NUdf;
+
+
+#ifdef coordinator_v0
+
+static const ui64 SAMPLE_BUFFER_SIZE = 1000; //10L * 1024 * 1024 * 1024;
+
+static std::atomic_int32_t PARTITION_SOURCE = 0;
+
+
+class Coordinator;
+
+class PartitionHandle {
+public:
+
+    PartitionHandle(std::function<void()>&& callback)
+    : Count_(0)
+    , CurrentBufferSize_(0)
+    , SampleBuffer_()
+    , FinishCallback_(std::move(callback)) 
+    { } 
+
+    bool accept(TUnboxedValue&& value) {
+        YQL_ENSURE(Accept_);
+        ui64 size = estimateSize(value);
+        if (this->CurrentBufferSize_ + size > SAMPLE_BUFFER_SIZE) {
+            Accept_ = false;
+            FinishCallback_();
+            return false;
+        }
+        Count_ += 1;
+        CurrentBufferSize_ += size;
+        SampleBuffer_.emplace_back(std::move(value));
+        return true;
+    }
+
+    const TVector<TUnboxedValue>& buffer() const {
+        return SampleBuffer_;
+    }
+
+private:
+    ui64 estimateSize(const TUnboxedValue& value) const {
+        // size_calcer ?
+        // пока просто количество
+        (void) value;
+        return 1;
+    }
+
+private:
+    ui64 Count_;
+    ui64 CurrentBufferSize_;
+    TVector<TUnboxedValue> SampleBuffer_;
+    bool Accept_ = true;
+    std::function<void()> FinishCallback_;
+};
+
+class Coordinator {
+
+private:
+    enum state {
+        collect_samples,
+        sampled_execution,
+        finished
+    };
+
+
+    void main_loop() {
+
+        // условие чтобы ждать регистрации всех партиций?
+
+        while (State_ != finished) {
+            // 1. собираем и ждем локальные гистограммы
+            {
+                std::unique_lock<std::mutex> lock_(Mutex_);
+                CoordinatorCv_.wait(lock_, [this] { return FinishedPartitions_.load() != PartitionsCount_.load(); });
+            }
+            // 2. считаем гистограмму
+            for (auto const& handle : Partitions_) {
+                handle.second.buffer(); // count hist ?
+            }
+
+            // 3. Отдаем функцию партиций
+            // тупо в первую
+
+            State_.store(sampled_execution);
+
+        }
+    }
+    
+public:
+
+    Coordinator() 
+    : Mutex_()
+    , Partitions_(), PartitionsCount_(0)
+    , State_(collect_samples)
+    , Thread_()
+    , CoordinatorCv_(), FinishedPartitions_(0)
+    , PartitionsCv_() {
+        Thread_ = std::thread([this] { main_loop(); });
+    }
+
+    PartitionHandle& registerPartition() {
+        int32_t id = PARTITION_SOURCE.fetch_add(1, std::memory_order_relaxed);
+        return registerPartition(id);
+    }
+
+    PartitionHandle& registerPartition(ui32 num) {
+        std::scoped_lock<std::mutex> lock(Mutex_);
+        if (!this->Partitions_.contains(num)) {
+          this->Partitions_.insert(
+              {num, PartitionHandle([this] {
+                 // нотифицируем координатор
+                 std::unique_lock<std::mutex> lock(this->Mutex_);
+                 this->FinishedPartitions_.fetch_add(1, std::memory_order_release);
+                 // не нотифицировать каждый раз?
+                 this->CoordinatorCv_.notify_one();
+               })});
+          PartitionsCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return this->Partitions_.at(num);
+    }
+    
+
+private:
+    std::mutex Mutex_;
+    std::unordered_map<ui32, PartitionHandle> Partitions_;
+    std::atomic_int32_t PartitionsCount_;
+    std::atomic<state> State_;
+    std::thread Thread_;
+    // collect samples
+    std::condition_variable CoordinatorCv_;
+    std::atomic_int32_t FinishedPartitions_;
+
+    // partition
+    std::condition_variable PartitionsCv_;
+
+};
+
+
+static Coordinator COORDINATOR;
+
+#endif
+
 
 
 class TDqOutputMultiConsumer : public IDqOutputConsumer {
@@ -96,6 +253,126 @@ public:
 private:
     IDqOutput::TPtr Output;
 };
+
+#ifdef coordinator_v0
+
+class TDqHistPartitionConsumer : public IDqOutputConsumer {
+private:
+    mutable bool IsWaitingFlag = false;
+    mutable TUnboxedValue WaitingValue;
+    mutable TUnboxedValueVector WideWaitingValues;
+    mutable IDqOutput::TPtr OutputWaiting;
+
+protected:
+
+    void DrainHandleBuffer() {
+        // правильно выставить waiting flag
+    }
+
+    void DrainWaiting() const {
+        if (Y_UNLIKELY(IsWaitingFlag)) {
+            if (OutputWaiting->IsFull()) {
+                return;
+            }
+            if (OutputWidth.Defined()) {
+                YQL_ENSURE(OutputWidth == WideWaitingValues.size());
+                OutputWaiting->WidePush(WideWaitingValues.data(), *OutputWidth);
+            } else {
+                OutputWaiting->Push(std::move(WaitingValue));
+            }
+            IsWaitingFlag = false;
+        }
+    }
+
+
+    virtual bool DoTryFinish() override {
+        DrainWaiting();
+        return !IsWaitingFlag;
+    }
+
+public:
+
+    TDqHistPartitionConsumer(TVector<IDqOutput::TPtr>&& outputs, TVector<TColumnInfo>&& keyColumns, TMaybe<ui32> outputWidth) 
+    : Outputs(std::move(outputs))
+    , KeyColumns(std::move(keyColumns))
+    , OutputWidth(outputWidth)
+    , Handle_(COORDINATOR.registerPartition())
+    , CollectSample_(true) {}
+
+    bool IsFull() const override {
+        DrainWaiting();
+        return IsWaitingFlag;
+    }
+
+    void Consume(NKikimr::NUdf::TUnboxedValue &&value) override {
+        YQL_ENSURE(!OutputWidth.Defined());
+
+        if (CollectSample_) {
+            auto result = Handle_.accept(std::move(value));
+            if (!result->HasValue()) {
+                return;
+            }
+            CollectSample_ = false;
+        }
+
+        ui32 partitionIndex = GetHistPartitionIndex(value);
+        if (Outputs[partitionIndex]->IsFull()) {
+            YQL_ENSURE(!IsWaitingFlag);
+            IsWaitingFlag = true;
+            OutputWaiting = Outputs[partitionIndex];
+            WaitingValue = std::move(value);
+        } else {
+            Outputs[partitionIndex]->Push(std::move(value));
+        }
+
+    }
+
+    void WideConsume(NKikimr::NUdf::TUnboxedValue *values, ui32 count) override {
+        YQL_ENSURE(OutputWidth.Defined() && count == OutputWidth);
+        ui32 partitionIndex = GetHistPartitionIndex(values);
+        if (Outputs[partitionIndex]->IsFull()) {
+            YQL_ENSURE(!IsWaitingFlag);
+            IsWaitingFlag = true;
+            OutputWaiting = Outputs[partitionIndex];
+            std::move(values, values + count, WideWaitingValues.data());
+        } else {
+            Outputs[partitionIndex]->WidePush(values, count);
+        }
+    }
+
+    void Consume(NDqProto::TCheckpoint &&checkpoint) override {
+        for (auto& output : Outputs) {
+            output->Push(NDqProto::TCheckpoint(checkpoint));
+        }
+    }
+
+    void Finish() override {
+        for (auto& output : Outputs) {
+            output->Finish();
+        }
+    }
+
+private:
+
+    size_t GetHistPartitionIndex(const TUnboxedValue& value) {
+
+    }
+
+    size_t GetHistPartitionIndex(const TUnboxedValue* values) {
+
+    }
+
+
+private:
+    const TVector<IDqOutput::TPtr> Outputs;
+    const TVector<TColumnInfo> KeyColumns;
+    const TMaybe<ui32> OutputWidth;
+    PartitionHandle& Handle_;
+    bool CollectSample_;
+    
+};
+
+#endif
 
 class TDqOutputHashPartitionConsumer : public IDqOutputConsumer {
 private:
@@ -614,6 +891,10 @@ IDqOutputConsumer::TPtr CreateOutputHashPartitionConsumer(
     YQL_ENSURE(!outputs.empty());
     YQL_ENSURE(!keyColumns.empty());
     TMaybe<ui32> outputWidth;
+
+    #ifdef coordinator_v0
+
+    #endif
     if (outputType->IsMulti()) {
         outputWidth = static_cast<const NMiniKQL::TMultiType*>(outputType)->GetElementsCount();
     }
