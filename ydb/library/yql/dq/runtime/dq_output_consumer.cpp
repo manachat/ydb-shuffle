@@ -23,6 +23,7 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <utility>
 
 #include <ydb/library/formats/arrow/size_calcer.h>
 
@@ -49,11 +50,18 @@ class Coordinator;
 class PartitionHandle {
 public:
 
+    PartitionHandle() = default;
+    PartitionHandle(const PartitionHandle&) = default;
+    PartitionHandle(PartitionHandle&&) = default;
+
     PartitionHandle(std::function<void()>&& callback)
     : Count_(0)
     , CurrentBufferSize_(0)
     , SampleBuffer_()
+    , Accept_(true)
     , FinishCallback_(std::move(callback)) 
+    , PartitionFunction_([](const TUnboxedValue&) { return 0; })
+    , PartitionerProvided_(false)
     { } 
 
     bool accept(TUnboxedValue&& value) {
@@ -74,6 +82,20 @@ public:
         return SampleBuffer_;
     }
 
+    size_t Partition(const TUnboxedValue& value) const {
+        return PartitionFunction_(value);
+    }
+
+    bool HasPartitionFunction() const {
+        return PartitionerProvided_.load();
+    }
+
+    void ProvidePartitionFunction(std::function<size_t(const TUnboxedValue&)>&& func) {
+        PartitionFunction_ = std::move(func);
+        PartitionerProvided_.store(true);
+    }
+    
+
 private:
     ui64 estimateSize(const TUnboxedValue& value) const {
         // size_calcer ?
@@ -86,8 +108,10 @@ private:
     ui64 Count_;
     ui64 CurrentBufferSize_;
     TVector<TUnboxedValue> SampleBuffer_;
-    bool Accept_ = true;
+    bool Accept_;
     std::function<void()> FinishCallback_;
+    std::function<size_t(const TUnboxedValue&)> PartitionFunction_;
+    std::atomic_bool PartitionerProvided_;
 };
 
 class Coordinator {
@@ -95,7 +119,7 @@ class Coordinator {
 private:
     enum state {
         collect_samples,
-        sampled_execution,
+        sampled_execution,  
         finished
     };
 
@@ -116,9 +140,15 @@ private:
             }
 
             // 3. Отдаем функцию партиций
-            // тупо в первую
-
+            // пока просто в первую
+            for (auto& handle : Partitions_) {
+                handle.second.ProvidePartitionFunction([] (const TUnboxedValue&) { return 0; });
+            }
             State_.store(sampled_execution);
+
+            // 4. finish?
+
+            State_.store(finished);
 
         }
     }
@@ -142,15 +172,15 @@ public:
 
     PartitionHandle& registerPartition(ui32 num) {
         std::scoped_lock<std::mutex> lock(Mutex_);
-        if (!this->Partitions_.contains(num)) {
-          this->Partitions_.insert(
-              {num, PartitionHandle([this] {
-                 // нотифицируем координатор
-                 std::unique_lock<std::mutex> lock(this->Mutex_);
-                 this->FinishedPartitions_.fetch_add(1, std::memory_order_release);
-                 // не нотифицировать каждый раз?
-                 this->CoordinatorCv_.notify_one();
-               })});
+        if (!Partitions_.contains(num)) {
+          PartitionHandle handle([this] {
+            // нотифицируем координатор
+            std::unique_lock<std::mutex> lock(this->Mutex_);
+            this->FinishedPartitions_.fetch_add(1, std::memory_order_release);
+            // не нотифицировать каждый раз?
+            this->CoordinatorCv_.notify_one();
+          });
+          Partitions_.insert({num, handle});
           PartitionsCount_.fetch_add(1, std::memory_order_relaxed);
         }
         return this->Partitions_.at(num);
@@ -265,11 +295,24 @@ private:
 
 protected:
 
-    void DrainHandleBuffer() {
-        // правильно выставить waiting flag
+    bool DrainHandleBuffer() const {
+        if (!Handle_.HasPartitionFunction()) {
+            return false;
+        }
+        // todo нормально забирать вектор
+        for (auto el : Handle_.buffer()) {
+            // может ждать?
+            ui32 partitionIndex = GetHistPartitionIndex(el);
+            Outputs[partitionIndex] -> Push(std::move(el));
+        }
+        
+        return true;
     }
 
     void DrainWaiting() const {
+        if (!DrainHandleBuffer()) {
+            return;
+        }
         if (Y_UNLIKELY(IsWaitingFlag)) {
             if (OutputWaiting->IsFull()) {
                 return;
@@ -308,11 +351,11 @@ public:
         YQL_ENSURE(!OutputWidth.Defined());
 
         if (CollectSample_) {
-            auto result = Handle_.accept(std::move(value));
-            if (!result->HasValue()) {
-                return;
+            if (!Handle_.accept(std::move(value))) {
+                CollectSample_ = false;
+                IsWaitingFlag = true;   
             }
-            CollectSample_ = false;
+            return;
         }
 
         ui32 partitionIndex = GetHistPartitionIndex(value);
@@ -354,12 +397,15 @@ public:
 
 private:
 
-    size_t GetHistPartitionIndex(const TUnboxedValue& value) {
-
+    size_t GetHistPartitionIndex(const TUnboxedValue& value) const {
+        YQL_ENSURE(Handle_.HasPartitionFunction());
+        return Handle_.Partition(value);
     }
 
-    size_t GetHistPartitionIndex(const TUnboxedValue* values) {
-
+    size_t GetHistPartitionIndex(const TUnboxedValue*) const {
+        // todo
+        YQL_ENSURE(false, "unimplemented");
+        return 0;
     }
 
 
