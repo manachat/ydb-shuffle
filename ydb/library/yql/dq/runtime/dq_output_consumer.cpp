@@ -15,6 +15,15 @@
 
 #define coordinator_v0
 
+#define shuf_logs
+
+#ifdef shuf_logs
+
+#include <yql/essentials/utils/log/log.h>
+
+
+#endif
+
 #ifdef coordinator_v0
 
 #include <mutex>
@@ -50,12 +59,13 @@ class Coordinator;
 class PartitionHandle {
 public:
 
-    PartitionHandle() = default;
+    PartitionHandle(ui32 num) = default;
     PartitionHandle(const PartitionHandle&) = default;
     PartitionHandle(PartitionHandle&&) = default;
 
-    PartitionHandle(std::function<void()>&& callback)
-    : Count_(0)
+    PartitionHandle(ui32 num, std::function<void()>&& callback)
+    : HandleNumber_(num)
+    , Count_(0)
     , CurrentBufferSize_(0)
     , SampleBuffer_()
     , Accept_(true)
@@ -68,6 +78,7 @@ public:
         YQL_ENSURE(Accept_);
         ui64 size = estimateSize(value);
         if (this->CurrentBufferSize_ + size > SAMPLE_BUFFER_SIZE) {
+            YQL_LOG(INFO) << "Handle " << HandleNumber_ << " finished";
             Accept_ = false;
             FinishCallback_();
             return false;
@@ -94,6 +105,10 @@ public:
         PartitionFunction_ = std::move(func);
         PartitionerProvided_.store(true);
     }
+
+    ui32 GetNumber() const {
+        return HandleNumber_;
+    }
     
 
 private:
@@ -105,6 +120,7 @@ private:
     }
 
 private:
+    ui32 HandleNumber_;
     ui64 Count_;
     ui64 CurrentBufferSize_;
     TVector<TUnboxedValue> SampleBuffer_;
@@ -124,75 +140,73 @@ private:
     };
 
 
-    void main_loop() {
+  
 
-        // условие чтобы ждать регистрации всех партиций?
-
-        while (State_ != finished) {
-            // 1. собираем и ждем локальные гистограммы
-            {
-                std::unique_lock<std::mutex> lock_(Mutex_);
-                CoordinatorCv_.wait(lock_, [this] { return FinishedPartitions_.load() != PartitionsCount_.load(); });
-            }
-            // 2. считаем гистограмму
-            for (auto const& handle : Partitions_) {
-                handle.second.buffer(); // count hist ?
-            }
-
-            // 3. Отдаем функцию партиций
-            // пока просто в первую
-            for (auto& handle : Partitions_) {
-                handle.second.ProvidePartitionFunction([] (const TUnboxedValue&) { return 0; });
-            }
-            State_.store(sampled_execution);
-
-            // 4. finish?
-
-            State_.store(finished);
-
+    void calculateHist() {
+        // типа считаем буферы со всех партиций
+        for (auto& handle : Partitions_) {
+            handle.second.ProvidePartitionFunction([] (const TUnboxedValue&) { return 0; });
         }
+        for (auto& handle : Partitions_) {
+            handle.second.ProvidePartitionFunction([] (const TUnboxedValue&) { return 0; });
+        }
+        State_.store(finished);
     }
     
 public:
 
-    Coordinator() 
-    : Mutex_()
-    , Partitions_(), PartitionsCount_(0)
+    Coordinator(ui32 partitions_count) 
+    : PartitionsCount_(partitions_count)
+    , Mutex_()
+    , Partitions_(), RegisteredCount_(0)
     , State_(collect_samples)
-    , Thread_()
     , CoordinatorCv_(), FinishedPartitions_(0)
-    , PartitionsCv_() {
-        Thread_ = std::thread([this] { main_loop(); });
+    , PartitionsCv_() 
+    {
     }
 
+    Coordinator(Coordinator&&) = default;
+
+    Coordinator& operator=(Coordinator&&) = default;
+
     PartitionHandle& registerPartition() {
-        int32_t id = PARTITION_SOURCE.fetch_add(1, std::memory_order_relaxed);
+        int32_t id = PARTITION_SOURCE.fetch_add(1);
         return registerPartition(id);
     }
 
     PartitionHandle& registerPartition(ui32 num) {
         std::scoped_lock<std::mutex> lock(Mutex_);
         if (!Partitions_.contains(num)) {
-          PartitionHandle handle([this] {
-            // нотифицируем координатор
+          PartitionHandle handle(num, [this, num] {
+            // синхронизируемся после сбора семпла
             std::unique_lock<std::mutex> lock(this->Mutex_);
-            this->FinishedPartitions_.fetch_add(1, std::memory_order_release);
-            // не нотифицировать каждый раз?
-            this->CoordinatorCv_.notify_one();
+            uint32_t parts = this->FinishedPartitions_.fetch_add(1);
+            YQL_LOG(INFO) << "Partition " << num << " synchronizing, partition count: " << parts + 1;
+            if (parts == PartitionsCount_ - 1) {
+                // последний считает гистограмму и будит всех
+                YQL_LOG(INFO) << "Partition " << num << " is the last one";
+                this->calculateHist();
+                PartitionsCv_.notify_all();
+            } else {
+                YQL_LOG(INFO) << "Partition " << num << " awaits others";
+                this->PartitionsCv_.wait(lock, [this]() { return State_.load() == finished; });
+            }
           });
-          Partitions_.insert({num, handle});
-          PartitionsCount_.fetch_add(1, std::memory_order_relaxed);
+          Partitions_.emplace(num, handle);
+          RegisteredCount_.fetch_add(1); // idk, не используется
         }
+
         return this->Partitions_.at(num);
     }
     
 
 private:
+    const ui32 PartitionsCount_;
     std::mutex Mutex_;
     std::unordered_map<ui32, PartitionHandle> Partitions_;
-    std::atomic_int32_t PartitionsCount_;
+    std::atomic_uint32_t RegisteredCount_;
     std::atomic<state> State_;
-    std::thread Thread_;
+
     // collect samples
     std::condition_variable CoordinatorCv_;
     std::atomic_int32_t FinishedPartitions_;
@@ -203,7 +217,19 @@ private:
 };
 
 
-static Coordinator COORDINATOR;
+static std::unordered_map<ui32, Coordinator> coordinators_;
+static std::mutex coordinators_mutex_;
+
+// q3 PRAGMA dq.MaxTasksPerStage='4';
+static const ui32 PARTITIONS_COUNT_4 = 4;
+
+static Coordinator& get_coordinator_for_stage(ui32 src) {
+    std::scoped_lock<std::mutex> lock(coordinators_mutex_);
+    if (!coordinators_.contains(src)) {
+        coordinators_.emplace(src, Coordinator(PARTITIONS_COUNT_4));
+    }
+    return coordinators_.at(src);
+}
 
 #endif
 
@@ -335,12 +361,20 @@ protected:
 
 public:
 
-    TDqHistPartitionConsumer(TVector<IDqOutput::TPtr>&& outputs, TVector<TColumnInfo>&& keyColumns, TMaybe<ui32> outputWidth) 
+    TDqHistPartitionConsumer(ui32 srcStage, TVector<IDqOutput::TPtr>&& outputs, TVector<TColumnInfo>&& keyColumns, TMaybe<ui32> outputWidth) 
     : Outputs(std::move(outputs))
     , KeyColumns(std::move(keyColumns))
     , OutputWidth(outputWidth)
-    , Handle_(COORDINATOR.registerPartition())
-    , CollectSample_(true) {}
+    , Handle_(get_coordinator_for_stage(srcStage).registerPartition())
+    , CollectSample_(true) 
+    , StageNum_(srcStage)
+    {
+        YQL_LOG(INFO) << "Hist consumer for stage " << srcStage;
+    }
+
+    ~TDqHistPartitionConsumer() {
+        YQL_LOG(INFO) << "Partitioner " << Handle_.GetNumber() << " of stage " << StageNum_ << " destroyed";
+    }
 
     bool IsFull() const override {
         DrainWaiting();
@@ -352,6 +386,7 @@ public:
 
         if (CollectSample_) {
             if (!Handle_.accept(std::move(value))) {
+                YQL_LOG(INFO) << "Partitioner " << Handle_.GetNumber() << " of stage " << StageNum_ << " finished sampling";
                 CollectSample_ = false;
                 IsWaitingFlag = true;   
             }
@@ -415,6 +450,7 @@ private:
     const TMaybe<ui32> OutputWidth;
     PartitionHandle& Handle_;
     bool CollectSample_;
+    ui32 StageNum_;
     
 };
 
@@ -459,6 +495,10 @@ public:
         if (outputWidth.Defined()) {
             WideWaitingValues.resize(*outputWidth);
         }
+
+        #ifdef shuf_logs
+        YQL_LOG(INFO) << "Create TDqOutputHashPartitionConsumer";
+        #endif
     }
 
     bool IsFull() const override {
@@ -559,6 +599,9 @@ public:
             Readers_.emplace_back(MakeBlockReader(TTypeInfoHelper(), blockType->GetItemType()));
             Hashers_.emplace_back(helper.MakeHasher(blockType->GetItemType()));
         }
+        #ifdef shuf_logs
+        YQL_LOG(INFO) << "Create TDqOutputHashPartitionConsumerScalar";
+        #endif
     }
 private:
     bool IsFull() const final {
@@ -682,6 +725,9 @@ public:
             Readers_.emplace_back(MakeBlockReader(helper, blockType->GetItemType()));
             Hashers_.emplace_back(blockHelper.MakeHasher(blockType->GetItemType()));
         }
+        #ifdef shuf_logs
+        YQL_LOG(INFO) << "Create TDqOutputHashPartitionConsumerBlock";
+        #endif
     }
 
 private:
@@ -929,6 +975,7 @@ IDqOutputConsumer::TPtr CreateOutputMapConsumer(IDqOutput::TPtr output) {
 
 IDqOutputConsumer::TPtr CreateOutputHashPartitionConsumer(
     TVector<IDqOutput::TPtr>&& outputs,
+    ui32 src, ui32 dst,
     TVector<TColumnInfo>&& keyColumns, const  NKikimr::NMiniKQL::TType* outputType,
     const NKikimr::NMiniKQL::THolderFactory& holderFactory,
     TMaybe<ui8> minFillPercentage,
@@ -938,9 +985,11 @@ IDqOutputConsumer::TPtr CreateOutputHashPartitionConsumer(
     YQL_ENSURE(!keyColumns.empty());
     TMaybe<ui32> outputWidth;
 
+    YQL_LOG(INFO) << "Create hash consumer func (src, dst) " << src << " " << dst; 
     #ifdef coordinator_v0
-
+        return MakeIntrusive<TDqHistPartitionConsumer>(src, std::move(outputs), std::move(keyColumns), outputType);
     #endif
+    
     if (outputType->IsMulti()) {
         outputWidth = static_cast<const NMiniKQL::TMultiType*>(outputType)->GetElementsCount();
     }
