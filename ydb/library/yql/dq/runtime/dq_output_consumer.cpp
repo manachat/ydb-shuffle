@@ -59,9 +59,13 @@ class Coordinator;
 class PartitionHandle {
 public:
 
-    PartitionHandle(ui32 num) = default;
+    PartitionHandle() = default;
     PartitionHandle(const PartitionHandle&) = default;
+
+    PartitionHandle& operator=(const PartitionHandle&) = default;
     PartitionHandle(PartitionHandle&&) = default;
+
+    PartitionHandle& operator=(PartitionHandle&&) = default;
 
     PartitionHandle(ui32 num, std::function<void()>&& callback)
     : HandleNumber_(num)
@@ -986,13 +990,14 @@ IDqOutputConsumer::TPtr CreateOutputHashPartitionConsumer(
     TMaybe<ui32> outputWidth;
 
     YQL_LOG(INFO) << "Create hash consumer func (src, dst) " << src << " " << dst; 
-    #ifdef coordinator_v0
-        return MakeIntrusive<TDqHistPartitionConsumer>(src, std::move(outputs), std::move(keyColumns), outputType);
-    #endif
     
     if (outputType->IsMulti()) {
         outputWidth = static_cast<const NMiniKQL::TMultiType*>(outputType)->GetElementsCount();
     }
+
+    #ifdef coordinator_v0
+    return MakeIntrusive<TDqHistPartitionConsumer>(src, std::move(outputs), std::move(keyColumns), outputWidth);
+    #endif
 
     if (AnyOf(keyColumns, [](const auto& info) { return !info.IsBlockOrScalar(); })) {
         return MakeIntrusive<TDqOutputHashPartitionConsumer>(std::move(outputs), std::move(keyColumns), outputWidth);
