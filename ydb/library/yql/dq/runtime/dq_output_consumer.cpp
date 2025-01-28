@@ -30,7 +30,6 @@
 #include <util/generic/vector.h>
 #include <unordered_map>
 #include <atomic>
-#include <thread>
 #include <functional>
 #include <utility>
 
@@ -61,13 +60,11 @@ public:
 
     PartitionHandle() = default;
     PartitionHandle(const PartitionHandle&) = default;
-
     PartitionHandle& operator=(const PartitionHandle&) = default;
     PartitionHandle(PartitionHandle&&) = default;
-
     PartitionHandle& operator=(PartitionHandle&&) = default;
 
-    PartitionHandle(ui32 num, std::function<void()>&& callback)
+    explicit PartitionHandle(ui32 num, std::function<void()>&& callback)
     : HandleNumber_(num)
     , Count_(0)
     , CurrentBufferSize_(0)
@@ -159,7 +156,7 @@ private:
     
 public:
 
-    Coordinator(ui32 partitions_count) 
+    explicit Coordinator(ui32 partitions_count) 
     : PartitionsCount_(partitions_count)
     , Mutex_()
     , Partitions_(), RegisteredCount_(0)
@@ -169,8 +166,9 @@ public:
     {
     }
 
+    Coordinator(const Coordinator&) = delete;
+    Coordinator& operator=(const Coordinator&) = delete;
     Coordinator(Coordinator&&) = default;
-
     Coordinator& operator=(Coordinator&&) = default;
 
     PartitionHandle& registerPartition() {
@@ -196,7 +194,9 @@ public:
                 this->PartitionsCv_.wait(lock, [this]() { return State_.load() == finished; });
             }
           });
-          Partitions_.emplace(num, handle);
+          ui32 cpy = num;
+          std::pair<ui32, PartitionHandle> p = std::make_pair(cpy, std::move(handle));
+          Partitions_.emplace(p);
           RegisteredCount_.fetch_add(1); // idk, не используется
         }
 
