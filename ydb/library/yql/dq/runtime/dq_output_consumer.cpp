@@ -32,7 +32,7 @@
 #include <atomic>
 #include <functional>
 #include <utility>
-
+#include <vector>
 #include <ydb/library/formats/arrow/size_calcer.h>
 
 #endif
@@ -59,10 +59,32 @@ class PartitionHandle {
 public:
 
     PartitionHandle() = default;
-    PartitionHandle(const PartitionHandle&) = default;
-    PartitionHandle& operator=(const PartitionHandle&) = default;
-    PartitionHandle(PartitionHandle&&) = default;
-    PartitionHandle& operator=(PartitionHandle&&) = default;
+    PartitionHandle(const PartitionHandle&) = delete;
+    PartitionHandle& operator=(const PartitionHandle&) = delete;
+
+    PartitionHandle(PartitionHandle&& other) noexcept
+    : HandleNumber_(other.HandleNumber_)
+    , Count_(other.Count_)
+    , CurrentBufferSize_(other.CurrentBufferSize_)
+    , SampleBuffer_(std::move(other.SampleBuffer_))
+    , Accept_(other.Accept_)
+    , FinishCallback_(std::move(other.FinishCallback_)) 
+    , PartitionFunction_(std::move(other.PartitionFunction_))
+    , PartitionerProvided_(other.PartitionerProvided_.load()) 
+    { };
+    PartitionHandle& operator=(PartitionHandle&& other) noexcept {
+        if (this != &other) {
+            this->HandleNumber_ = other.HandleNumber_;
+            this->Count_ = other.Count_;
+            this->CurrentBufferSize_ = other.CurrentBufferSize_;
+            this->SampleBuffer_ = std::move(other.SampleBuffer_);
+            this->Accept_ = other.Accept_;
+            this->FinishCallback_ = std::move(other.FinishCallback_);
+            this->PartitionFunction_ = std::move(other.PartitionFunction_);
+            this->PartitionerProvided_.store((other.PartitionerProvided_.load()));
+        }
+        return *this;
+    };
 
     explicit PartitionHandle(ui32 num, std::function<void()>&& callback)
     : HandleNumber_(num)
@@ -90,7 +112,7 @@ public:
         return true;
     }
 
-    const TVector<TUnboxedValue>& buffer() const {
+    const std::vector<TUnboxedValue>& buffer() const {
         return SampleBuffer_;
     }
 
@@ -124,7 +146,7 @@ private:
     ui32 HandleNumber_;
     ui64 Count_;
     ui64 CurrentBufferSize_;
-    TVector<TUnboxedValue> SampleBuffer_;
+    std::vector<TUnboxedValue> SampleBuffer_;
     bool Accept_;
     std::function<void()> FinishCallback_;
     std::function<size_t(const TUnboxedValue&)> PartitionFunction_;
@@ -140,9 +162,6 @@ private:
         finished
     };
 
-
-  
-
     void calculateHist() {
         // типа считаем буферы со всех партиций
         for (auto& handle : Partitions_) {
@@ -156,10 +175,10 @@ private:
     
 public:
 
-    explicit Coordinator(ui32 partitions_count) 
+    Coordinator(ui32 partitions_count) 
     : PartitionsCount_(partitions_count)
     , Mutex_()
-    , Partitions_(), RegisteredCount_(0)
+    , Partitions_(partitions_count), RegisteredCount_(0)
     , State_(collect_samples)
     , CoordinatorCv_(), FinishedPartitions_(0)
     , PartitionsCv_() 
@@ -168,8 +187,8 @@ public:
 
     Coordinator(const Coordinator&) = delete;
     Coordinator& operator=(const Coordinator&) = delete;
-    Coordinator(Coordinator&&) = default;
-    Coordinator& operator=(Coordinator&&) = default;
+    Coordinator(Coordinator&& other) = delete;
+    Coordinator& operator=(Coordinator&&) = delete;
 
     PartitionHandle& registerPartition() {
         int32_t id = PARTITION_SOURCE.fetch_add(1);
@@ -194,9 +213,7 @@ public:
                 this->PartitionsCv_.wait(lock, [this]() { return State_.load() == finished; });
             }
           });
-          ui32 cpy = num;
-          std::pair<ui32, PartitionHandle> p = std::make_pair(cpy, std::move(handle));
-          Partitions_.emplace(p);
+          Partitions_.emplace(num, std::move(handle));
           RegisteredCount_.fetch_add(1); // idk, не используется
         }
 
@@ -230,7 +247,7 @@ static const ui32 PARTITIONS_COUNT_4 = 4;
 static Coordinator& get_coordinator_for_stage(ui32 src) {
     std::scoped_lock<std::mutex> lock(coordinators_mutex_);
     if (!coordinators_.contains(src)) {
-        coordinators_.emplace(src, Coordinator(PARTITIONS_COUNT_4));
+        coordinators_.emplace(src, PARTITIONS_COUNT_4);
     }
     return coordinators_.at(src);
 }
