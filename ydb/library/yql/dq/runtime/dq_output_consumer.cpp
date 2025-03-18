@@ -32,6 +32,7 @@
 #include <atomic>
 #include <functional>
 #include <utility>
+#include <queue>
 #include <vector>
 #include <ydb/library/formats/arrow/size_calcer.h>
 
@@ -47,6 +48,99 @@ using namespace NUdf;
 
 
 #ifdef coordinator_v0
+
+
+struct Bucket {
+    i64 left;
+    i64 right;
+    ui64 count;
+};
+
+struct Border {
+    i64 value;
+    bool open;
+    ui32 sourceIndex;
+    ui32 bucketIndex;
+    const Bucket& source;
+};
+
+struct Histogram {
+    std::vector<Bucket> buckets;
+};
+
+
+
+static Histogram multiMerge(const std::vector<Histogram>& sources) {
+    using bucketKey = std::pair<ui32, ui32>;
+
+    Histogram result;
+
+    std::unordered_map<bucketKey, const Bucket*> currentBuckets;
+    auto cmp = [](const Border& left, const Border& right) {
+        if (left.value == right.value) {
+            if (left.open && right.open) return false;
+            return left.open;
+        }
+        return left.value < right.value;
+    };
+    std::priority_queue<Border, std::vector<Border>, decltype(cmp)> pq;
+    int sourceI = 0;
+    for (const auto& hist : sources) {
+        int bucketI = 0;
+        for (auto& bucket : hist.buckets) {
+            pq.emplace(bucket.left, true, sourceI, bucketI, bucket);
+            pq.emplace(bucket.right, false, sourceI, bucketI, bucket);
+            bucketI++;
+        }
+        sourceI++;
+    }
+
+    Border currBorder = pq.top();
+    pq.pop();
+    YQL_ENSURE(currBorder.open);
+    
+    i64 currLine = currBorder.value;
+    currentBuckets.emplace(std::make_pair(currBorder.sourceIndex, currBorder.bucketIndex), &currBorder.source);
+    while (!pq.empty() && pq.top().value == currLine) {
+        YQL_ENSURE(pq.top().open); // maybe just skip
+        Border border = pq.top();
+        pq.pop();
+        currentBuckets.emplace(std::make_pair(border.sourceIndex, border.bucketIndex), &border.source);
+    }
+
+    while (!pq.empty()) {
+        // nextline should not be equal to curr, aggregate everything
+        i64 nextLine = pq.top().value;
+
+        // calculate new interval for current buckets
+        ui64 count = 0;
+        for (const auto& [k, bucket] : currentBuckets) {
+            ui64 len = bucket->right - bucket->left;
+            ui64 range = nextLine - currLine;
+            count += bucket->count * range / len; // approx, change to double?
+        }
+
+        result.buckets.emplace_back(currLine, nextLine, count);
+
+        // get all closing borders on the line, remove from current
+        while(!pq.empty() && pq.top().value == nextLine && !pq.top().open) {
+            Border closing = pq.top();
+            currentBuckets.erase({closing.sourceIndex, closing.bucketIndex});
+            pq.pop();
+        }
+
+        // get all opening borders on the line, add to curr
+        while(!pq.empty() && pq.top().value == nextLine && pq.top().open) {
+            Border opening = pq.top();
+            currentBuckets.emplace(std::make_pair(opening.sourceIndex, opening.bucketIndex), &opening.source);
+            pq.pop();
+        }
+
+        currLine = nextLine;
+    }
+
+    return result;
+}
 
 static const ui64 SAMPLE_BUFFER_SIZE = 1000; //10L * 1024 * 1024 * 1024;
 
@@ -70,8 +164,11 @@ public:
     , Accept_(other.Accept_)
     , FinishCallback_(std::move(other.FinishCallback_)) 
     , PartitionFunction_(std::move(other.PartitionFunction_))
-    , PartitionerProvided_(other.PartitionerProvided_.load()) 
-    { };
+    , PartitionerProvided_(other.PartitionerProvided_.load()) { 
+
+    };
+
+
     PartitionHandle& operator=(PartitionHandle&& other) noexcept {
         if (this != &other) {
             this->HandleNumber_ = other.HandleNumber_;
@@ -110,6 +207,10 @@ public:
         CurrentBufferSize_ += size;
         SampleBuffer_.emplace_back(std::move(value));
         return true;
+    }
+
+    bool accept(ui32 count) {
+        
     }
 
     const std::vector<TUnboxedValue>& buffer() const {
@@ -428,6 +529,16 @@ public:
 
     void WideConsume(NKikimr::NUdf::TUnboxedValue *values, ui32 count) override {
         YQL_ENSURE(OutputWidth.Defined() && count == OutputWidth);
+
+        if (CollectSample_) {
+            if (!Handle_.accept(std::move(value))) {
+                YQL_LOG(INFO) << "Partitioner " << Handle_.GetNumber() << " of stage " << StageNum_ << " finished sampling";
+                CollectSample_ = false;
+                IsWaitingFlag = true;   
+            }
+            return;
+        }
+        
         ui32 partitionIndex = GetHistPartitionIndex(values);
         if (Outputs[partitionIndex]->IsFull()) {
             YQL_ENSURE(!IsWaitingFlag);
@@ -461,7 +572,8 @@ private:
     size_t GetHistPartitionIndex(const TUnboxedValue*) const {
         // todo
         YQL_ENSURE(false, "unimplemented");
-        return 0;
+        YQL_ENSURE(Handle_.HasPartitionFunction());
+        return Handle_.Partition(value);
     }
 
 
