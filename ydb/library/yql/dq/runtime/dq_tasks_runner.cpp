@@ -28,6 +28,15 @@
 
 #include <util/generic/scope.h>
 
+#define shuf_logs
+
+#ifdef shuf_logs
+
+#include <yql/essentials/utils/log/log.h>
+
+
+#endif
+
 
 using namespace NKikimr;
 using namespace NKikimr::NMiniKQL;
@@ -187,7 +196,9 @@ IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outpu
             GetColumnsInfo(type, outputDesc.GetHashPartition().GetKeyColumns(), keyColumns);
             YQL_ENSURE(!keyColumns.empty());
             YQL_ENSURE(outputDesc.GetHashPartition().GetPartitionsCount() == outputDesc.ChannelsSize());
-            return CreateOutputHashPartitionConsumer(std::move(outputs), std::move(keyColumns), type, holderFactory, minFillPercentage, pgBuilder);
+            ui32 dst = outputDesc.GetChannels(0).GetDstStageId();
+            ui32 src = outputDesc.GetChannels(0).GetSrcStageId();
+            return CreateOutputHashPartitionConsumer(std::move(outputs), src, dst, std::move(keyColumns), type, holderFactory, minFillPercentage, pgBuilder);
         }
 
         case NDqProto::TTaskOutput::kBroadcast: {
@@ -512,6 +523,7 @@ public:
     void Prepare(const TDqTaskSettings& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
         const IDqTaskRunnerExecutionContext& execCtx) override
     {
+
         TaskId = task.GetId();
         auto entry = BuildTask(task);
 
@@ -677,7 +689,14 @@ public:
                 outputs.clear();
                 outputs.emplace_back(transform->TransformInput);
             }
-
+            #ifdef shuf_logs
+            if (outputDesc.GetTypeCase() == NDqProto::TTaskOutput::kHashPartition) {
+            
+                YQL_LOG(INFO) << "Create hash consumer " << task.GetInputs().size() << " inputs " << task.GetOutputs().size() << " outputs "
+                << task.GetStageId() << " stage " << task.GetId() << " task " << task.OutputsSize() << " output size " << task.InputsSize() << " Input size " 
+                << outputDesc.GetChannels(0).GetDstStageId() << " DST STAGE " << outputDesc.GetChannels(0).GetSrcStageId() << " SRC STAGE " ;
+            }
+            #endif
             {
                 auto guard = BindAllocator();
                 outputConsumers[i] = execCtx.CreateOutputConsumer(outputDesc, entry->OutputItemTypes[i],
